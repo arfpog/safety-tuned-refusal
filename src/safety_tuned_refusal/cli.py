@@ -53,9 +53,42 @@ def cmd_judge(args: argparse.Namespace):
         openrouter_site_url=args.openrouter_site_url,
         openrouter_app_name=args.openrouter_app_name,
     )
+    print(
+        f"Judge provider={config.provider} model={config.model_name} "
+        f"rate_limit_rpm={config.rate_limit_rpm} api_key_env={config.api_key_env}"
+    )
     output_csv = Path(args.output) if args.output else None
-    labeled_df = label_responses(responses_df, config, output_csv=output_csv)
+    labeled_df = label_responses(
+        responses_df,
+        config,
+        output_csv=output_csv,
+        print_example_every=args.print_example_every,
+        example_max_chars=args.example_max_chars,
+    )
     print(f"Labeled {len(labeled_df)} responses")
+    if args.print_example and len(labeled_df) > 0:
+        idx = max(0, min(int(args.example_row), len(labeled_df) - 1))
+        row = labeled_df.iloc[idx]
+        print("\n--- Example judged row ---")
+        print(f"row_index: {idx}")
+        for col in [
+            "prompt_id",
+            "axis_id",
+            "identity_id",
+            "risk_level",
+            "sample_index",
+            "behavior_label_llm",
+            "safety_binary",
+            "judge_rationale",
+        ]:
+            if col in labeled_df.columns:
+                print(f"{col}: {row.get(col)}")
+        raw = str(row.get("judge_raw_output", "") or "")
+        max_chars = int(args.example_max_chars or 0)
+        if max_chars > 0 and len(raw) > max_chars:
+            raw = raw[:max_chars] + "...(truncated)"
+        print("judge_raw_output:")
+        print(raw)
     if output_csv:
         print(f"Saved to {output_csv}")
 
@@ -181,6 +214,29 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=JudgeConfig().rate_limit_rpm,
         help="Rate limit in requests per minute.",
+    )
+    p_judge.add_argument(
+        "--print-example",
+        action="store_true",
+        help="Print one example judged output row after labeling completes.",
+    )
+    p_judge.add_argument(
+        "--print-example-every",
+        type=int,
+        default=0,
+        help="Print a periodic example during judging (e.g., 50 prints every 50 rows).",
+    )
+    p_judge.add_argument(
+        "--example-row",
+        type=int,
+        default=0,
+        help="Row index in the labeled output to print as an example.",
+    )
+    p_judge.add_argument(
+        "--example-max-chars",
+        type=int,
+        default=2000,
+        help="Max characters to print for judge_raw_output (0 disables truncation).",
     )
     p_judge.add_argument(
         "--api-key-env",

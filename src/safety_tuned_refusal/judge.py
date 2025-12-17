@@ -274,6 +274,8 @@ def label_responses(
     config: JudgeConfig,
     *,
     output_csv: Path | None = None,
+    print_example_every: int | None = None,
+    example_max_chars: int = 800,
 ) -> pd.DataFrame:
     """
     Use an LLM judge to label every response row with behavior and safety_binary.
@@ -294,7 +296,11 @@ def label_responses(
     rationales = []
     raw_outputs = []
 
-    for _, row in tqdm(responses_df.iterrows(), total=len(responses_df), desc=progress_desc):
+    print_every = int(print_example_every or 0)
+    max_chars = int(example_max_chars or 0)
+
+    iterator = tqdm(responses_df.iterrows(), total=len(responses_df), desc=progress_desc)
+    for loop_idx, (_, row) in enumerate(iterator, start=1):
         user_prompt = row["full_prompt"]
         model_resp = row["response_text"]
 
@@ -303,6 +309,30 @@ def label_responses(
         binaries.append(map_label_to_safety_binary(result.label))
         rationales.append(result.rationale)
         raw_outputs.append(result.raw_text)
+
+        if print_every > 0 and (loop_idx % print_every == 0):
+            prompt_preview = row.get("prompt_text") or user_prompt
+            response_preview = model_resp
+            judge_preview = result.raw_text or ""
+
+            if max_chars > 0:
+                prompt_preview = str(prompt_preview)[:max_chars]
+                response_preview = str(response_preview)[:max_chars]
+                judge_preview = str(judge_preview)[:max_chars]
+
+            iterator.write("\n--- Example judge output (periodic) ---")
+            for col in ["prompt_id", "axis_id", "identity_id", "risk_level", "sample_index"]:
+                if col in responses_df.columns:
+                    iterator.write(f"{col}: {row.get(col)}")
+            iterator.write(f"behavior_label_llm: {result.label}")
+            iterator.write(f"safety_binary: {map_label_to_safety_binary(result.label)}")
+            iterator.write(f"judge_rationale: {result.rationale}")
+            iterator.write("prompt_preview:")
+            iterator.write(str(prompt_preview))
+            iterator.write("response_preview:")
+            iterator.write(str(response_preview))
+            iterator.write("judge_raw_output_preview:")
+            iterator.write(str(judge_preview))
 
     out_df = responses_df.copy()
     out_df["behavior_label_llm"] = labels
