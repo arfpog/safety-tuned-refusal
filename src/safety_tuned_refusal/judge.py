@@ -146,9 +146,11 @@ class GeminiJudge:
                 f"Missing Gemini API key. Set {config.api_key_env} in your environment."
             )
         genai.configure(api_key=api_key)
+        self._genai = genai
         self.model_name = config.model_name
         self.min_interval = 60.0 / config.rate_limit_rpm
         self._last_request_time = 0.0
+        self._timeout_s = int(config.timeout_s or 0)
         self._model = genai.GenerativeModel(self.model_name)
 
     def _respect_rate_limit(self):
@@ -162,9 +164,21 @@ class GeminiJudge:
             model_response=model_response_text,
         )
         self._respect_rate_limit()
-        resp = self._model.generate_content(full_prompt)
-        self._last_request_time = time.time()
-        raw = (resp.text or "").strip()
+        try:
+            if self._timeout_s > 0:
+                try:
+                    resp = self._model.generate_content(
+                        full_prompt, request_options={"timeout": self._timeout_s}
+                    )
+                except TypeError:
+                    resp = self._model.generate_content(full_prompt)
+            else:
+                resp = self._model.generate_content(full_prompt)
+            self._last_request_time = time.time()
+            raw = (resp.text or "").strip()
+        except Exception as e:
+            self._last_request_time = time.time()
+            return JudgeResult(label=None, rationale=f"Judge error: {e}", raw_text=None)
 
         obj, err = _extract_json_obj(raw)
         if obj is None:
@@ -195,6 +209,7 @@ class OpenRouterJudge:
 
         self.min_interval = 60.0 / config.rate_limit_rpm
         self._last_request_time = 0.0
+        self._timeout_s = int(config.timeout_s or 120)
 
         self._headers = {
             "Authorization": f"Bearer {api_key}",
@@ -215,7 +230,7 @@ class OpenRouterJudge:
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(url, data=data, headers=self._headers, method="POST")
         try:
-            with urllib.request.urlopen(req, timeout=120) as resp:
+            with urllib.request.urlopen(req, timeout=self._timeout_s) as resp:
                 body = resp.read().decode("utf-8")
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
@@ -292,6 +307,53 @@ class _StartTimeRateLimiter:
             time.sleep(wait)
 
 
+class _TokenBucketLimiter:
+    """Thread-safe token bucket limiter for an approximate tokens-per-minute budget."""
+
+    def __init__(self, tokens_per_minute: int | None):
+        tpm = int(tokens_per_minute or 0)
+        self._rate_tps = (tpm / 60.0) if tpm > 0 else 0.0
+        self._capacity = float(tpm) if tpm > 0 else 0.0
+        self._tokens = float(tpm) if tpm > 0 else 0.0
+        self._last = time.monotonic()
+        self._lock = threading.Lock()
+
+    def acquire(self, tokens: int):
+        if self._rate_tps <= 0:
+            return
+        need = float(max(0, int(tokens)))
+        if need <= 0:
+            return
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                elapsed = max(0.0, now - self._last)
+                self._last = now
+                self._tokens = min(self._capacity, self._tokens + elapsed * self._rate_tps)
+
+                if self._tokens >= need:
+                    self._tokens -= need
+                    return
+
+                shortfall = need - self._tokens
+                wait = shortfall / self._rate_tps if self._rate_tps > 0 else 0.0
+                self._tokens = 0.0
+
+            if wait > 0:
+                time.sleep(wait)
+
+
+def _estimate_tokens(text: str) -> int:
+    """
+    Rough token estimate without a tokenizer dependency.
+
+    Rule of thumb: ~4 characters/token for English-ish text.
+    """
+    if not text:
+        return 0
+    return max(1, int(len(text) / 4))
+
+
 def _make_judge(config: JudgeConfig):
     provider = (config.provider or "gemini").strip().lower()
     if provider == "gemini":
@@ -336,6 +398,7 @@ def label_responses(
     print_every = int(print_example_every or 0)
     max_chars = int(example_max_chars or 0)
     effective_concurrency = max(1, int(concurrency or 1))
+    token_limiter = _TokenBucketLimiter(config.rate_limit_tpm)
 
     def _print_example(writer, row_dict: Dict, result: JudgeResult):
         prompt_preview = row_dict.get("prompt_text") or row_dict.get("full_prompt") or ""
@@ -365,7 +428,15 @@ def label_responses(
         judge = _make_judge(config)
         iterator = tqdm(enumerate(rows, start=1), total=n_rows, desc=progress_desc)
         for loop_idx, row_dict in iterator:
-            result = judge.judge(row_dict["full_prompt"], row_dict["response_text"])
+            user_prompt = row_dict.get("prompt_text") or row_dict.get("full_prompt") or ""
+            model_resp = row_dict.get("response_text") or ""
+            token_limiter.acquire(
+                _estimate_tokens(JUDGE_SYSTEM_INSTRUCTIONS)
+                + _estimate_tokens(user_prompt)
+                + _estimate_tokens(model_resp)
+                + 256
+            )
+            result = judge.judge(user_prompt, model_resp)
             pos = loop_idx - 1
             labels[pos] = result.label
             binaries[pos] = map_label_to_safety_binary(result.label)
@@ -376,7 +447,7 @@ def label_responses(
                 _print_example(iterator.write, row_dict, result)
     else:
         limiter = _StartTimeRateLimiter(config.rate_limit_rpm)
-        worker_config = replace(config, rate_limit_rpm=10**9)
+        worker_config = replace(config, rate_limit_rpm=10**9, rate_limit_tpm=None)
 
         thread_local = threading.local()
 
@@ -388,9 +459,17 @@ def label_responses(
             return inst
 
         def _task(pos: int, row_dict: Dict):
+            user_prompt = row_dict.get("prompt_text") or row_dict.get("full_prompt") or ""
+            model_resp = row_dict.get("response_text") or ""
+            token_limiter.acquire(
+                _estimate_tokens(JUDGE_SYSTEM_INSTRUCTIONS)
+                + _estimate_tokens(user_prompt)
+                + _estimate_tokens(model_resp)
+                + 256
+            )
             limiter.acquire()
             judge = _get_thread_judge()
-            result = judge.judge(row_dict["full_prompt"], row_dict["response_text"])
+            result = judge.judge(user_prompt, model_resp)
             return pos, row_dict, result
 
         progress_desc = f"{progress_desc} (concurrent={effective_concurrency})"

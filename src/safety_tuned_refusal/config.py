@@ -27,7 +27,9 @@ class JudgeConfig:
     provider: str = DEFAULT_JUDGE_PROVIDER  # "gemini" | "openrouter"
     model_name: str = DEFAULT_JUDGE_MODEL
     rate_limit_rpm: int = 15
+    rate_limit_tpm: int | None = None
     api_key_env: str = "GOOGLE_API_KEY"
+    timeout_s: int = 120
     openrouter_base_url: str = DEFAULT_OPENROUTER_BASE_URL
     openrouter_site_url: str | None = None
     openrouter_app_name: str | None = None

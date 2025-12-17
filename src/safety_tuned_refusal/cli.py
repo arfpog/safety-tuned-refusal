@@ -48,14 +48,17 @@ def cmd_judge(args: argparse.Namespace):
         provider=args.provider,
         model_name=args.judge_model,
         rate_limit_rpm=args.rate_limit_rpm,
+        rate_limit_tpm=args.rate_limit_tpm,
         api_key_env=args.api_key_env,
+        timeout_s=args.timeout_s,
         openrouter_base_url=args.openrouter_base_url,
         openrouter_site_url=args.openrouter_site_url,
         openrouter_app_name=args.openrouter_app_name,
     )
     print(
         f"Judge provider={config.provider} model={config.model_name} "
-        f"rate_limit_rpm={config.rate_limit_rpm} api_key_env={config.api_key_env}"
+        f"rate_limit_rpm={config.rate_limit_rpm} rate_limit_tpm={config.rate_limit_tpm} "
+        f"timeout_s={config.timeout_s} api_key_env={config.api_key_env}"
     )
     output_csv = Path(args.output) if args.output else None
     labeled_df = label_responses(
@@ -107,6 +110,10 @@ def cmd_analyze(args: argparse.Namespace):
         n_splits=args.n_splits,
         n_shuffles=args.n_shuffles,
         C=args.C,
+        probe_backend=args.probe_backend,
+        probe_max_iter=args.probe_max_iter,
+        probe_torch_device=args.probe_torch_device,
+        probe_torch_lr=args.probe_torch_lr,
         save_prefix=args.save_prefix,
     )
     print_summary_report(results, df)
@@ -215,6 +222,18 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=JudgeConfig().rate_limit_rpm,
         help="Rate limit in requests per minute.",
+    )
+    p_judge.add_argument(
+        "--rate-limit-tpm",
+        type=int,
+        default=JudgeConfig().rate_limit_tpm,
+        help="Approximate token-per-minute limit for the judge (helps avoid TPM quota errors).",
+    )
+    p_judge.add_argument(
+        "--timeout-s",
+        type=int,
+        default=JudgeConfig().timeout_s,
+        help="Per-request timeout in seconds for the judge API call.",
     )
     p_judge.add_argument(
         "--print-example",
@@ -327,6 +346,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_analyze.add_argument("--n-shuffles", type=int, default=5, help="Shuffled label runs.")
     p_analyze.add_argument(
         "-C", type=float, default=1.0, dest="C", help="Inverse regularization strength."
+    )
+    p_analyze.add_argument(
+        "--probe-backend",
+        choices=["sklearn", "torch"],
+        default="sklearn",
+        help="Linear probe training backend (torch enables nn.Linear and GPU use).",
+    )
+    p_analyze.add_argument(
+        "--probe-max-iter",
+        type=int,
+        default=1000,
+        help="Max optimizer iterations for probe fitting (sklearn or torch LBFGS).",
+    )
+    p_analyze.add_argument(
+        "--probe-torch-device",
+        default=None,
+        help="Torch device for probes when --probe-backend torch (e.g., cuda, cpu). Defaults to auto.",
+    )
+    p_analyze.add_argument(
+        "--probe-torch-lr",
+        type=float,
+        default=1.0,
+        help="Torch LBFGS learning rate for probes when --probe-backend torch.",
     )
     p_analyze.add_argument(
         "--save-prefix", default="analysis", help="Prefix for saved probe outputs."

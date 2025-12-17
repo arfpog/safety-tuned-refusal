@@ -18,6 +18,15 @@ from tqdm.auto import tqdm
 
 from .metrics import compute_identity_safety_rates
 
+
+def _standardize_train_val(
+    X_train: np.ndarray, X_val: np.ndarray, eps: float = 1e-6
+) -> Tuple[np.ndarray, np.ndarray]:
+    mean = X_train.mean(axis=0, keepdims=True)
+    std = X_train.std(axis=0, keepdims=True)
+    std = np.where(std < eps, 1.0, std)
+    return (X_train - mean) / std, (X_val - mean) / std
+
 def prepare_batch(tokenizer, prompts: List[str], add_generation_prompt: bool = True) -> Dict[str, torch.Tensor]:
     """
     Build a chat-style batch for a list of user prompts.
@@ -200,6 +209,121 @@ def train_linear_probe(
     return np.mean(accuracies), np.std(accuracies), clf_full.coef_
 
 
+def train_linear_probe_torch(
+    X: np.ndarray,
+    y: np.ndarray,
+    *,
+    n_splits: int = 5,
+    max_iter: int = 200,
+    lr: float = 1.0,
+    l2: float = 0.0,
+    device: str = "cuda",
+    random_state: int = 42,
+) -> Tuple[float, float, np.ndarray]:
+    """
+    Train a linear probe with PyTorch nn.Linear (logistic / softmax regression).
+
+    This can run on GPU and is often faster than sklearn when you have a big GPU.
+    """
+    if device == "cuda" and not torch.cuda.is_available():
+        device = "cpu"
+
+    y = np.asarray(y)
+    classes = np.unique(y)
+    n_classes = int(classes.size)
+    if n_classes < 2:
+        raise ValueError("Need at least 2 classes for probing")
+
+    # Map to 0..K-1 for multiclass.
+    if n_classes > 2:
+        class_to_idx = {c: i for i, c in enumerate(classes.tolist())}
+        y_mapped = np.vectorize(class_to_idx.get)(y)
+    else:
+        y_mapped = y.astype(int)
+
+    d = int(X.shape[1])
+    out_dim = 1 if n_classes == 2 else n_classes
+
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    accuracies = []
+
+    def _fit_one(X_train: np.ndarray, y_train: np.ndarray, X_val: np.ndarray, y_val: np.ndarray) -> float:
+        X_train, X_val = _standardize_train_val(X_train, X_val)
+        X_train_t = torch.tensor(X_train, dtype=torch.float32, device=device)
+        X_val_t = torch.tensor(X_val, dtype=torch.float32, device=device)
+
+        if n_classes == 2:
+            y_train_t = torch.tensor(y_train.astype(np.float32), device=device).view(-1, 1)
+            y_val_np = y_val.astype(int)
+            loss_fn = torch.nn.BCEWithLogitsLoss()
+        else:
+            y_train_t = torch.tensor(y_train.astype(np.int64), device=device)
+            y_val_np = y_val.astype(int)
+            loss_fn = torch.nn.CrossEntropyLoss()
+
+        torch.manual_seed(random_state)
+        model = torch.nn.Linear(d, out_dim, bias=True).to(device)
+        optimizer = torch.optim.LBFGS(model.parameters(), lr=lr, max_iter=max_iter)
+
+        def closure():
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(X_train_t)
+            loss = loss_fn(logits, y_train_t)
+            if l2 and l2 > 0:
+                loss = loss + 0.5 * float(l2) * (model.weight.pow(2).sum())
+            loss.backward()
+            return loss
+
+        model.train()
+        optimizer.step(closure)
+
+        model.eval()
+        with torch.no_grad():
+            logits = model(X_val_t)
+            if n_classes == 2:
+                pred = (torch.sigmoid(logits) >= 0.5).long().view(-1).cpu().numpy()
+            else:
+                pred = torch.argmax(logits, dim=1).cpu().numpy()
+        return float(np.mean(pred == y_val_np))
+
+    for train_idx, val_idx in skf.split(X, y_mapped):
+        accuracies.append(_fit_one(X[train_idx], y_mapped[train_idx], X[val_idx], y_mapped[val_idx]))
+
+    # Fit on all data for direction vector.
+    X_all = X.copy()
+    mean = X_all.mean(axis=0, keepdims=True)
+    std = X_all.std(axis=0, keepdims=True)
+    std = np.where(std < 1e-6, 1.0, std)
+    X_all = (X_all - mean) / std
+    X_all_t = torch.tensor(X_all, dtype=torch.float32, device=device)
+    if n_classes == 2:
+        y_all_t = torch.tensor(y_mapped.astype(np.float32), device=device).view(-1, 1)
+        loss_fn_all = torch.nn.BCEWithLogitsLoss()
+    else:
+        y_all_t = torch.tensor(y_mapped.astype(np.int64), device=device)
+        loss_fn_all = torch.nn.CrossEntropyLoss()
+
+    torch.manual_seed(random_state)
+    model_full = torch.nn.Linear(d, out_dim, bias=True).to(device)
+    optimizer_full = torch.optim.LBFGS(model_full.parameters(), lr=lr, max_iter=max_iter)
+
+    def closure_full():
+        optimizer_full.zero_grad(set_to_none=True)
+        logits = model_full(X_all_t)
+        loss = loss_fn_all(logits, y_all_t)
+        if l2 and l2 > 0:
+            loss = loss + 0.5 * float(l2) * (model_full.weight.pow(2).sum())
+        loss.backward()
+        return loss
+
+    model_full.train()
+    optimizer_full.step(closure_full)
+
+    with torch.no_grad():
+        coef = model_full.weight.detach().cpu().numpy()
+    return float(np.mean(accuracies)), float(np.std(accuracies)), coef
+
+
 def probe_across_layers(
     hidden_states: np.ndarray,
     labels: np.ndarray,
@@ -207,6 +331,11 @@ def probe_across_layers(
     n_splits: int = 5,
     C: float = 1.0,
     random_state: int = 42,
+    desc: str = "Probing layers",
+    backend: str = "sklearn",
+    max_iter: int = 1000,
+    torch_device: str | None = None,
+    torch_lr: float = 1.0,
 ) -> Dict:
     """
     Train probes at each layer with both true and shuffled labels.
@@ -226,12 +355,33 @@ def probe_across_layers(
     shuffled_stds = []
     coefs = []
 
-    for layer in tqdm(range(n_layers), desc="Probing layers"):
+    backend_norm = (backend or "sklearn").strip().lower()
+    device = torch_device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    for layer in tqdm(range(n_layers), desc=desc):
         X = hidden_states[:, layer, :]
 
-        mean_acc, std_acc, coef = train_linear_probe(
-            X, labels, n_splits=n_splits, C=C, random_state=random_state
-        )
+        if backend_norm == "torch":
+            l2 = 1.0 / float(C) if C and C > 0 else 0.0
+            mean_acc, std_acc, coef = train_linear_probe_torch(
+                X,
+                labels,
+                n_splits=n_splits,
+                max_iter=max_iter,
+                lr=torch_lr,
+                l2=l2,
+                device=device,
+                random_state=random_state,
+            )
+        else:
+            mean_acc, std_acc, coef = train_linear_probe(
+                X,
+                labels,
+                n_splits=n_splits,
+                C=C,
+                max_iter=max_iter,
+                random_state=random_state,
+            )
         true_accs.append(mean_acc)
         true_stds.append(std_acc)
         coefs.append(coef)
@@ -239,9 +389,27 @@ def probe_across_layers(
         shuffle_accs_layer = []
         for s in range(n_shuffles):
             shuffled_y = np.random.RandomState(random_state + s).permutation(labels)
-            s_mean, _, _ = train_linear_probe(
-                X, shuffled_y, n_splits=n_splits, C=C, random_state=random_state + s
-            )
+            if backend_norm == "torch":
+                l2 = 1.0 / float(C) if C and C > 0 else 0.0
+                s_mean, _, _ = train_linear_probe_torch(
+                    X,
+                    shuffled_y,
+                    n_splits=n_splits,
+                    max_iter=max_iter,
+                    lr=torch_lr,
+                    l2=l2,
+                    device=device,
+                    random_state=random_state + s,
+                )
+            else:
+                s_mean, _, _ = train_linear_probe(
+                    X,
+                    shuffled_y,
+                    n_splits=n_splits,
+                    C=C,
+                    max_iter=max_iter,
+                    random_state=random_state + s,
+                )
             shuffle_accs_layer.append(s_mean)
         shuffled_accs.append(np.mean(shuffle_accs_layer))
         shuffled_stds.append(np.std(shuffle_accs_layer))
@@ -279,12 +447,19 @@ def run_identity_probes(
         if one_vs_rest:
             for identity in df_axis[identity_col].unique():
                 y = (df_axis[identity_col] == identity).astype(int).values
-                probe_result = probe_across_layers(X_axis, y, **probe_kwargs)
+                probe_result = probe_across_layers(
+                    X_axis,
+                    y,
+                    desc=f"Probing layers (identity {axis}:{identity})",
+                    **probe_kwargs,
+                )
                 results[axis][identity] = probe_result
         else:
             le = LabelEncoder()
             y = le.fit_transform(df_axis[identity_col].values)
-            probe_result = probe_across_layers(X_axis, y, **probe_kwargs)
+            probe_result = probe_across_layers(
+                X_axis, y, desc=f"Probing layers (identity multiclass {axis})", **probe_kwargs
+            )
             probe_result["classes"] = le.classes_
             results[axis]["multiclass"] = probe_result
 
@@ -297,7 +472,12 @@ def run_safety_probes(
     **probe_kwargs,
 ) -> Dict:
     """Run safety behavior probes (safety-inflected vs direct)."""
-    return probe_across_layers(response_hidden_states, safety_labels, **probe_kwargs)
+    return probe_across_layers(
+        response_hidden_states,
+        safety_labels,
+        desc="Probing layers (safety: response-start)",
+        **probe_kwargs,
+    )
 
 
 def run_safety_probes_from_prompt(
@@ -306,7 +486,12 @@ def run_safety_probes_from_prompt(
     **probe_kwargs,
 ) -> Dict:
     """Run safety probes on prompt representations."""
-    return probe_across_layers(prompt_hidden_states, safety_labels, **probe_kwargs)
+    return probe_across_layers(
+        prompt_hidden_states,
+        safety_labels,
+        desc="Probing layers (safety: prompt)",
+        **probe_kwargs,
+    )
 
 
 def compute_cosine_similarity(v1: np.ndarray, v2: np.ndarray) -> float:
@@ -561,6 +746,10 @@ def run_full_analysis(
     n_splits: int = 5,
     n_shuffles: int = 5,
     C: float = 1.0,
+    probe_backend: str = "sklearn",
+    probe_max_iter: int = 1000,
+    probe_torch_device: str | None = None,
+    probe_torch_lr: float = 1.0,
     save_prefix: str = "analysis",
 ):
     """
@@ -600,6 +789,10 @@ def run_full_analysis(
         n_splits=n_splits,
         n_shuffles=n_shuffles,
         C=C,
+        backend=probe_backend,
+        max_iter=probe_max_iter,
+        torch_device=probe_torch_device,
+        torch_lr=probe_torch_lr,
     )
     results["identity_probes"] = identity_probes
 
@@ -611,6 +804,10 @@ def run_full_analysis(
         n_splits=n_splits,
         n_shuffles=n_shuffles,
         C=C,
+        backend=probe_backend,
+        max_iter=probe_max_iter,
+        torch_device=probe_torch_device,
+        torch_lr=probe_torch_lr,
     )
     results["safety_probes"] = safety_probes
 
@@ -620,6 +817,10 @@ def run_full_analysis(
         n_splits=n_splits,
         n_shuffles=n_shuffles,
         C=C,
+        backend=probe_backend,
+        max_iter=probe_max_iter,
+        torch_device=probe_torch_device,
+        torch_lr=probe_torch_lr,
     )
     results["safety_probes_prompt"] = safety_probes_prompt
 
