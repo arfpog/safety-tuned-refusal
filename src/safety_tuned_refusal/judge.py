@@ -14,6 +14,9 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from dataclasses import replace
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 from typing import Dict, Tuple
 
 import pandas as pd
@@ -261,6 +264,43 @@ class OpenRouterJudge:
         return JudgeResult(label=label, rationale=rationale, raw_text=raw)
 
 
+class _StartTimeRateLimiter:
+    """
+    Thread-safe rate limiter that spaces out request start times.
+
+    This allows concurrency to overlap network latency while still respecting a
+    global RPM cap.
+    """
+
+    def __init__(self, rate_limit_rpm: int):
+        self._interval = (
+            60.0 / float(rate_limit_rpm) if rate_limit_rpm and rate_limit_rpm > 0 else 0.0
+        )
+        self._lock = threading.Lock()
+        self._next_time = 0.0
+
+    def acquire(self):
+        if self._interval <= 0:
+            return
+        with self._lock:
+            now = time.time()
+            if self._next_time < now:
+                self._next_time = now
+            wait = self._next_time - now
+            self._next_time += self._interval
+        if wait > 0:
+            time.sleep(wait)
+
+
+def _make_judge(config: JudgeConfig):
+    provider = (config.provider or "gemini").strip().lower()
+    if provider == "gemini":
+        return GeminiJudge(config)
+    if provider == "openrouter":
+        return OpenRouterJudge(config)
+    raise ValueError(f"Unknown judge provider: {config.provider}")
+
+
 def map_label_to_safety_binary(label: str | None):
     if label == "Direct":
         return 0
@@ -276,63 +316,98 @@ def label_responses(
     output_csv: Path | None = None,
     print_example_every: int | None = None,
     example_max_chars: int = 800,
+    concurrency: int = 1,
 ) -> pd.DataFrame:
     """
     Use an LLM judge to label every response row with behavior and safety_binary.
     Requires columns full_prompt and response_text.
     """
     provider = (config.provider or "gemini").strip().lower()
-    if provider == "gemini":
-        judge = GeminiJudge(config)
-        progress_desc = "Gemini judge"
-    elif provider == "openrouter":
-        judge = OpenRouterJudge(config)
-        progress_desc = "OpenRouter judge"
-    else:
-        raise ValueError(f"Unknown judge provider: {config.provider}")
+    progress_desc = "Gemini judge" if provider == "gemini" else "OpenRouter judge"
 
-    labels = []
-    binaries = []
-    rationales = []
-    raw_outputs = []
+    rows = responses_df.to_dict(orient="records")
+    n_rows = len(rows)
+
+    labels: list[str | None] = [None] * n_rows
+    binaries: list[int | None] = [None] * n_rows
+    rationales: list[str | None] = [None] * n_rows
+    raw_outputs: list[str | None] = [None] * n_rows
 
     print_every = int(print_example_every or 0)
     max_chars = int(example_max_chars or 0)
+    effective_concurrency = max(1, int(concurrency or 1))
 
-    iterator = tqdm(responses_df.iterrows(), total=len(responses_df), desc=progress_desc)
-    for loop_idx, (_, row) in enumerate(iterator, start=1):
-        user_prompt = row["full_prompt"]
-        model_resp = row["response_text"]
+    def _print_example(writer, row_dict: Dict, result: JudgeResult):
+        prompt_preview = row_dict.get("prompt_text") or row_dict.get("full_prompt") or ""
+        response_preview = row_dict.get("response_text") or ""
+        judge_preview = result.raw_text or ""
 
-        result = judge.judge(user_prompt, model_resp)
-        labels.append(result.label)
-        binaries.append(map_label_to_safety_binary(result.label))
-        rationales.append(result.rationale)
-        raw_outputs.append(result.raw_text)
+        if max_chars > 0:
+            prompt_preview = str(prompt_preview)[:max_chars]
+            response_preview = str(response_preview)[:max_chars]
+            judge_preview = str(judge_preview)[:max_chars]
 
-        if print_every > 0 and (loop_idx % print_every == 0):
-            prompt_preview = row.get("prompt_text") or user_prompt
-            response_preview = model_resp
-            judge_preview = result.raw_text or ""
+        writer("\n--- Example judge output (periodic) ---")
+        for col in ["prompt_id", "axis_id", "identity_id", "risk_level", "sample_index"]:
+            if col in row_dict:
+                writer(f"{col}: {row_dict.get(col)}")
+        writer(f"behavior_label_llm: {result.label}")
+        writer(f"safety_binary: {map_label_to_safety_binary(result.label)}")
+        writer(f"judge_rationale: {result.rationale}")
+        writer("prompt_preview:")
+        writer(str(prompt_preview))
+        writer("response_preview:")
+        writer(str(response_preview))
+        writer("judge_raw_output_preview:")
+        writer(str(judge_preview))
 
-            if max_chars > 0:
-                prompt_preview = str(prompt_preview)[:max_chars]
-                response_preview = str(response_preview)[:max_chars]
-                judge_preview = str(judge_preview)[:max_chars]
+    if effective_concurrency == 1:
+        judge = _make_judge(config)
+        iterator = tqdm(enumerate(rows, start=1), total=n_rows, desc=progress_desc)
+        for loop_idx, row_dict in iterator:
+            result = judge.judge(row_dict["full_prompt"], row_dict["response_text"])
+            pos = loop_idx - 1
+            labels[pos] = result.label
+            binaries[pos] = map_label_to_safety_binary(result.label)
+            rationales[pos] = result.rationale
+            raw_outputs[pos] = result.raw_text
 
-            iterator.write("\n--- Example judge output (periodic) ---")
-            for col in ["prompt_id", "axis_id", "identity_id", "risk_level", "sample_index"]:
-                if col in responses_df.columns:
-                    iterator.write(f"{col}: {row.get(col)}")
-            iterator.write(f"behavior_label_llm: {result.label}")
-            iterator.write(f"safety_binary: {map_label_to_safety_binary(result.label)}")
-            iterator.write(f"judge_rationale: {result.rationale}")
-            iterator.write("prompt_preview:")
-            iterator.write(str(prompt_preview))
-            iterator.write("response_preview:")
-            iterator.write(str(response_preview))
-            iterator.write("judge_raw_output_preview:")
-            iterator.write(str(judge_preview))
+            if print_every > 0 and (loop_idx % print_every == 0):
+                _print_example(iterator.write, row_dict, result)
+    else:
+        limiter = _StartTimeRateLimiter(config.rate_limit_rpm)
+        worker_config = replace(config, rate_limit_rpm=10**9)
+
+        thread_local = threading.local()
+
+        def _get_thread_judge():
+            inst = getattr(thread_local, "judge", None)
+            if inst is None:
+                inst = _make_judge(worker_config)
+                thread_local.judge = inst
+            return inst
+
+        def _task(pos: int, row_dict: Dict):
+            limiter.acquire()
+            judge = _get_thread_judge()
+            result = judge.judge(row_dict["full_prompt"], row_dict["response_text"])
+            return pos, row_dict, result
+
+        progress_desc = f"{progress_desc} (concurrent={effective_concurrency})"
+        with ThreadPoolExecutor(max_workers=effective_concurrency) as executor:
+            futures = [executor.submit(_task, pos, row_dict) for pos, row_dict in enumerate(rows)]
+
+            completed = 0
+            for fut in tqdm(as_completed(futures), total=len(futures), desc=progress_desc):
+                pos, row_dict, result = fut.result()
+                labels[pos] = result.label
+                binaries[pos] = map_label_to_safety_binary(result.label)
+                rationales[pos] = result.rationale
+                raw_outputs[pos] = result.raw_text
+
+                completed += 1
+                if print_every > 0 and (completed % print_every == 0):
+                    _print_example(tqdm.write, row_dict, result)
 
     out_df = responses_df.copy()
     out_df["behavior_label_llm"] = labels

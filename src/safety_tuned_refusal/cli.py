@@ -64,6 +64,7 @@ def cmd_judge(args: argparse.Namespace):
         output_csv=output_csv,
         print_example_every=args.print_example_every,
         example_max_chars=args.example_max_chars,
+        concurrency=args.concurrency,
     )
     print(f"Labeled {len(labeled_df)} responses")
     if args.print_example and len(labeled_df) > 0:
@@ -225,6 +226,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Print a periodic example during judging (e.g., 50 prints every 50 rows).",
+    )
+    p_judge.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Run multiple judge requests concurrently (helps when per-request latency is high).",
     )
     p_judge.add_argument(
         "--example-row",
