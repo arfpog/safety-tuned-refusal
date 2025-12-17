@@ -1,0 +1,17 @@
+# Core inference and data
+torch
+transformers>=4.42.0
+accelerate
+sentencepiece
+pandas
+tqdm
+numpy
+
+# Evaluation and stats
+statsmodels
+scikit-learn
+seaborn
+matplotlib
+
+# External judge
+google-generativeai

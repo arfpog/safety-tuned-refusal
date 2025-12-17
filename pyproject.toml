@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "safety-tuned-refusal"
+version = "0.1.0"
+description = "Reproducible pipeline for generating, judging, and probing safety-tuned refusals."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+  "torch",
+  "transformers>=4.42.0",
+  "accelerate",
+  "sentencepiece",
+  "pandas",
+  "tqdm",
+  "google-generativeai",
+  "statsmodels",
+  "scikit-learn",
+  "numpy",
+  "seaborn",
+  "matplotlib",
+]
+
+[project.optional-dependencies]
+dev = [
+  "ipykernel",
+  "ruff",
+]
+
+[project.scripts]
+safety-tuned-refusal = "safety_tuned_refusal.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
