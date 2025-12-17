@@ -9,6 +9,8 @@ A runnable, modular take on the original Colab notebook for generating refusal-o
   `safety-tuned-refusal generate-responses --prompts data/prompts.csv --output data/responses_aligned.csv --model meta-llama/Meta-Llama-3-8B-Instruct --n-samples 5`
 - Label with Gemini (needs `GOOGLE_API_KEY`):  
   `safety-tuned-refusal judge --responses data/responses_aligned.csv --output data/responses_aligned_labeled.csv`
+- Or label with OpenRouter (needs `OPENROUTER_API_KEY`):  
+  `safety-tuned-refusal judge --provider openrouter --api-key-env OPENROUTER_API_KEY --judge-model openai/gpt-4o-mini --responses data/responses_aligned.csv --output data/responses_aligned_labeled.csv`
 - Report P(safety) by identity with bootstrap CIs (no HF model needed):  
   `safety-tuned-refusal report-safety --labeled-responses data/responses_aligned_labeled.csv --risk-level all --output data/identity_bootstrap.csv`
 - Run probes/plots (heavy; expects GPU):  

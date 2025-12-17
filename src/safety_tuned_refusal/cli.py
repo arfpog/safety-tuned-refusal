@@ -45,9 +45,13 @@ def cmd_generate_responses(args: argparse.Namespace):
 def cmd_judge(args: argparse.Namespace):
     responses_df = pd.read_csv(args.responses)
     config = JudgeConfig(
+        provider=args.provider,
         model_name=args.judge_model,
         rate_limit_rpm=args.rate_limit_rpm,
         api_key_env=args.api_key_env,
+        openrouter_base_url=args.openrouter_base_url,
+        openrouter_site_url=args.openrouter_site_url,
+        openrouter_app_name=args.openrouter_app_name,
     )
     output_csv = Path(args.output) if args.output else None
     labeled_df = label_responses(responses_df, config, output_csv=output_csv)
@@ -154,7 +158,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_responses.set_defaults(func=cmd_generate_responses)
 
-    p_judge = subparsers.add_parser("judge", help="Label responses with Gemini.")
+    p_judge = subparsers.add_parser("judge", help="Label responses with an LLM judge.")
     p_judge.add_argument("--responses", default="responses_aligned.csv", help="Input responses CSV.")
     p_judge.add_argument(
         "--output",
@@ -162,7 +166,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Where to write labeled responses CSV.",
     )
     p_judge.add_argument(
-        "--judge-model", default=JudgeConfig().model_name, help="Gemini judge model name."
+        "--provider",
+        choices=["gemini", "openrouter"],
+        default=JudgeConfig().provider,
+        help="Which judge backend to use.",
+    )
+    p_judge.add_argument(
+        "--judge-model",
+        default=JudgeConfig().model_name,
+        help="Judge model name (Gemini model id or OpenRouter model slug).",
     )
     p_judge.add_argument(
         "--rate-limit-rpm",
@@ -173,7 +185,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_judge.add_argument(
         "--api-key-env",
         default=JudgeConfig().api_key_env,
-        help="Env var that holds the Gemini API key.",
+        help="Env var that holds the judge API key (Gemini or OpenRouter).",
+    )
+    p_judge.add_argument(
+        "--openrouter-base-url",
+        default=JudgeConfig().openrouter_base_url,
+        help="OpenRouter API base URL (only used with --provider openrouter).",
+    )
+    p_judge.add_argument(
+        "--openrouter-site-url",
+        default=JudgeConfig().openrouter_site_url,
+        help="Optional OpenRouter HTTP-Referer header value.",
+    )
+    p_judge.add_argument(
+        "--openrouter-app-name",
+        default=JudgeConfig().openrouter_app_name,
+        help="Optional OpenRouter X-Title header value.",
     )
     p_judge.set_defaults(func=cmd_judge)
 
